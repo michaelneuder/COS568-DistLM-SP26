@@ -1,5 +1,5 @@
-sudo apt-get update
-sudo apt-get install htop dstat python3-pip tmux
+sudo apt-get update -y
+sudo apt-get install -y htop dstat python3-pip tmux
 echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 

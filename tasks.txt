@@ -36,6 +36,7 @@ gather-scatter over the gradients
 adding arguments to the parser for ip, port, and world size
 add the init_process_group call
 
+add timing list for iteration. average at the end (only on the master node)
 
 
 

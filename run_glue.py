@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -109,13 +110,16 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Total optimization steps = %d", t_total)
 
     global_step = 0
+    iter_times = []
+    iter_losses = []
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for i in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            iter_start = time.time()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -165,8 +169,10 @@ def train(args, train_dataset, model, tokenizer):
                     offset += numel
 
             tr_loss += loss.item()
-            if step < 5:
-                print("Step {}, loss {}".format(step, loss.item()))
+            if i > 0:
+                iter_times.append(time.time() - iter_start)
+            iter_losses.append(loss.item())
+            print("Rank {} iter {} loss: {:.3f}".format(args.local_rank, step, loss.item()))
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -184,7 +190,13 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        evaluate(args, model, tokenizer)
+        if args.local_rank in [-1, 0]:
+            evaluate(args, model, tokenizer)
+
+    print("Rank {} losses: {}".format(args.local_rank, iter_losses))
+    if args.local_rank in [-1, 0]:
+        avg_iter_time = sum(iter_times) / len(iter_times)
+        print("Average time per iteration: {:.3f}s ({} iterations)".format(avg_iter_time, len(iter_times)))
 
     return global_step, tr_loss / global_step
 
@@ -446,7 +458,8 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    evaluate(args, model, tokenizer, prefix="")
+    if args.local_rank in [-1, 0]:
+        evaluate(args, model, tokenizer, prefix="")
 
 if __name__ == "__main__":
     main()
