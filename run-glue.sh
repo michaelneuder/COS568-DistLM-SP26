@@ -1,4 +1,4 @@
-export GLUE_DIR=$HOME/glue_data
+export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
 export TASK_NAME=RTE
 
 python3 run_glue.py \
@@ -7,7 +7,7 @@ python3 run_glue.py \
   --task_name $TASK_NAME \
   --do_train \
   --do_eval \
-  --data_dir $GLUE_DIR/$TASK_NAME \
+  --data_dir $GLUE_DIR \
   --max_seq_length 128 \
   --per_device_train_batch_size 64 \
   --learning_rate 2e-5 \
