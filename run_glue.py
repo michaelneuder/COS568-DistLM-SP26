@@ -71,7 +71,10 @@ def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    if args.local_rank != -1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank)
+    else:
+        train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -134,6 +137,32 @@ def train(args, train_dataset, model, tokenizer):
                 # TODO(cos568): perform backward pass here (expect one line of code)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            # Gradient aggregation via scatter-gather
+            if args.local_rank != -1:
+                grads = [p.grad for p in model.parameters()]
+                flat = torch.cat([g.flatten() for g in grads])
+
+                if args.local_rank == 0:
+                    gather_list = [torch.zeros_like(flat) for _ in range(args.world_size)]
+                else:
+                    gather_list = None
+                torch.distributed.gather(flat, gather_list, dst=0)
+
+                if args.local_rank == 0:
+                    avg_flat = torch.stack(gather_list).mean(dim=0)
+                    scatter_list = [avg_flat.clone() for _ in range(args.world_size)]
+                else:
+                    scatter_list = None
+                torch.distributed.scatter(flat, scatter_list, src=0)
+
+                # Unflatten back into individual gradients
+                offset = 0
+                for p in model.parameters():
+                    numel = p.grad.numel()
+                    avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
+                    p.grad = avg_grad
+                    offset += numel
 
             tr_loss += loss.item()
             if step < 5:
@@ -347,12 +376,25 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str, default="localhost",
+                        help="Master node IP address for distributed training.")
+    parser.add_argument("--master_port", type=str, default="12345",
+                        help="Master node port for distributed training.")
+    parser.add_argument("--world_size", type=int, default=4,
+                        help="Total number of processes for distributed training.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
+    if args.local_rank != -1:
+        torch.distributed.init_process_group(
+            backend='gloo',
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
