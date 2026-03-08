@@ -150,7 +150,7 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             # Gradient aggregation via scatter-gather
-            # '''
+            '''
             if args.local_rank != -1:
                 grads = [p.grad for p in model.parameters()]
                 flat = torch.cat([g.flatten() for g in grads])
@@ -175,15 +175,15 @@ def train(args, train_dataset, model, tokenizer):
                     avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
                     p.grad = avg_grad
                     offset += numel
-            # '''
+            '''
 
             # Gradient aggregation via all-reduce instead
-            '''
+            # '''
             if args.local_rank != -1:
                 for p in model.parameters():
                     torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
                     p.grad /= args.world_size
-            '''
+            # '''
 
             tr_loss += loss.item()
             if step > 0:
