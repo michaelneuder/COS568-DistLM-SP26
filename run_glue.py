@@ -117,6 +117,12 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    prof = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=torch.profiler.schedule(wait=1, warmup=0, active=3, repeat=1),
+        on_trace_ready=lambda p: p.export_chrome_trace('./rank_{}_step_{}.json'.format(args.local_rank, p.step_num)),
+    )
+    prof.start()
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -144,7 +150,7 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             # Gradient aggregation via scatter-gather
-            '''
+            # '''
             if args.local_rank != -1:
                 grads = [p.grad for p in model.parameters()]
                 flat = torch.cat([g.flatten() for g in grads])
@@ -169,7 +175,7 @@ def train(args, train_dataset, model, tokenizer):
                     avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
                     p.grad = avg_grad
                     offset += numel
-            '''
+            # '''
 
             # Gradient aggregation via all-reduce instead
             '''
@@ -192,17 +198,20 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+            prof.step()
+
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
-        
+
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
         evaluate(args, model, tokenizer)
 
+    prof.stop()
     print("Rank {} losses: {}".format(args.local_rank, iter_losses))
     if args.local_rank in [-1, 0]:
         avg_iter_time = sum(iter_times) / len(iter_times)
@@ -459,8 +468,10 @@ def main():
 
     model.to(args.device)
 
+    '''
     if args.local_rank != -1:
         model = DistributedDataParallel(model)
+    '''
 
     logger.info("Training/evaluation parameters %s", args)
 
