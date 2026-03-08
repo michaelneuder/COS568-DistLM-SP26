@@ -458,8 +458,7 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    if args.local_rank in [-1, 0]:
-        evaluate(args, model, tokenizer, prefix="")
+    evaluate(args, model, tokenizer, prefix="")
 
 if __name__ == "__main__":
     main()
