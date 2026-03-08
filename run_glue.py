@@ -200,8 +200,7 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        if args.local_rank in [-1, 0]:
-            evaluate(args, model, tokenizer)
+        evaluate(args, model, tokenizer)
 
     print("Rank {} losses: {}".format(args.local_rank, iter_losses))
     if args.local_rank in [-1, 0]:
