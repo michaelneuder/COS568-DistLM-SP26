@@ -116,7 +116,7 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for i in train_iterator:
+    for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             iter_start = time.time()
@@ -143,6 +143,7 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             # Gradient aggregation via scatter-gather
+            '''
             if args.local_rank != -1:
                 grads = [p.grad for p in model.parameters()]
                 flat = torch.cat([g.flatten() for g in grads])
@@ -167,9 +168,16 @@ def train(args, train_dataset, model, tokenizer):
                     avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
                     p.grad = avg_grad
                     offset += numel
+            '''
+
+            # Gradient aggregation via all-reduce instead
+            if args.local_rank != -1:
+                for p in model.parameters():
+                    torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
+                    p.grad /= args.world_size
 
             tr_loss += loss.item()
-            if i > 0:
+            if step > 0:
                 iter_times.append(time.time() - iter_start)
             iter_losses.append(loss.item())
             print("Rank {} iter {} loss: {:.3f}".format(args.local_rank, step, loss.item()))
@@ -255,12 +263,13 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank in [-1, 0]:
+            output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
 
     return results
 
