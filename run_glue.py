@@ -178,12 +178,12 @@ def train(args, train_dataset, model, tokenizer):
             '''
 
             # Gradient aggregation via all-reduce instead
-            # '''
+            '''
             if args.local_rank != -1:
                 for p in model.parameters():
                     torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
                     p.grad /= args.world_size
-            # '''
+            '''
 
             tr_loss += loss.item()
             if step > 0:
@@ -468,10 +468,10 @@ def main():
 
     model.to(args.device)
 
-    '''
+    # '''
     if args.local_rank != -1:
         model = DistributedDataParallel(model)
-    '''
+    # '''
 
     logger.info("Training/evaluation parameters %s", args)
 
