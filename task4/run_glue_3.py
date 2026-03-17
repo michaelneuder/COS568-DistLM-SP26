@@ -22,12 +22,14 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel 
 from tqdm import tqdm, trange
 
 # import a previous version of the HuggingFace Transformers package
@@ -71,7 +73,10 @@ def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    if args.local_rank != -1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank)
+    else:
+        train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -106,13 +111,22 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Total optimization steps = %d", t_total)
 
     global_step = 0
+    iter_times = []
+    iter_losses = []
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    prof = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=torch.profiler.schedule(wait=1, warmup=0, active=3, repeat=1),
+        on_trace_ready=lambda p: p.export_chrome_trace('./rank_{}_step_{}.json'.format(args.local_rank, p.step_num)),
+    )
+    prof.start()
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            iter_start = time.time()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -132,19 +146,23 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 ##################################################
                 # TODO(cos568): perform backward pass here (expect one line of code)
-                
-                ##################################################
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
+            if step > 0:
+                iter_times.append(time.time() - iter_start)
+            iter_losses.append(loss.item())
+            print("Rank {} iter {} loss: {:.3f}".format(args.local_rank, step, loss.item()))
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
-                ##################################################
+                optimizer.step()
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+
+            prof.step()
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -152,11 +170,16 @@ def train(args, train_dataset, model, tokenizer):
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
-        
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
 
         ##################################################
+        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
+        evaluate(args, model, tokenizer)
+
+    prof.stop()
+    print("Rank {} losses: {}".format(args.local_rank, iter_losses))
+    if args.local_rank in [-1, 0]:
+        avg_iter_time = sum(iter_times) / len(iter_times)
+        print("Average time per iteration: {:.3f}s ({} iterations)".format(avg_iter_time, len(iter_times)))
 
     return global_step, tr_loss / global_step
 
@@ -215,12 +238,13 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank in [-1, 0]:
+            output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
 
     return results
 
@@ -348,12 +372,25 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str, default="localhost",
+                        help="Master node IP address for distributed training.")
+    parser.add_argument("--master_port", type=str, default="12345",
+                        help="Master node port for distributed training.")
+    parser.add_argument("--world_size", type=int, default=4,
+                        help="Total number of processes for distributed training.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
+    if args.local_rank != -1:
+        torch.distributed.init_process_group(
+            backend='gloo',
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
@@ -388,13 +425,15 @@ def main():
     ##################################################
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-
-    ##################################################
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     model.to(args.device)
+
+    if args.local_rank != -1:
+        model = DistributedDataParallel(model)
 
     logger.info("Training/evaluation parameters %s", args)
 

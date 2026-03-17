@@ -149,42 +149,6 @@ def train(args, train_dataset, model, tokenizer):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-            # Gradient aggregation via scatter-gather
-            '''
-            if args.local_rank != -1:
-                grads = [p.grad for p in model.parameters()]
-                flat = torch.cat([g.flatten() for g in grads])
-
-                if args.local_rank == 0:
-                    gather_list = [torch.zeros_like(flat) for _ in range(args.world_size)]
-                else:
-                    gather_list = None
-                torch.distributed.gather(flat, gather_list, dst=0)
-
-                if args.local_rank == 0:
-                    avg_flat = torch.stack(gather_list).mean(dim=0)
-                    scatter_list = [avg_flat.clone() for _ in range(args.world_size)]
-                else:
-                    scatter_list = None
-                torch.distributed.scatter(flat, scatter_list, src=0)
-
-                # Unflatten back into individual gradients
-                offset = 0
-                for p in model.parameters():
-                    numel = p.grad.numel()
-                    avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
-                    p.grad = avg_grad
-                    offset += numel
-            '''
-
-            # Gradient aggregation via all-reduce instead
-            '''
-            if args.local_rank != -1:
-                for p in model.parameters():
-                    torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
-                    p.grad /= args.world_size
-            '''
-
             tr_loss += loss.item()
             if step > 0:
                 iter_times.append(time.time() - iter_start)
@@ -468,10 +432,8 @@ def main():
 
     model.to(args.device)
 
-    # '''
     if args.local_rank != -1:
         model = DistributedDataParallel(model)
-    # '''
 
     logger.info("Training/evaluation parameters %s", args)
 
