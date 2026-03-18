@@ -54,9 +54,37 @@ In task 2, we run for a single epoch with the following extra CLI flags
   --local_rank 0
 ```
 
-where we change the local rank based on the node we are running on. We also modfiy the batch size to 16 examples per minibatch per machine
+where we change the local rank based on the node we are running on. We also modify the batch size to 16 examples per minibatch per machine
 ```
 --per_device_train_batch_size 16
+```
+
+We implement the gather-scatter as follows. First we flatten the gradients object, before gathering all of the separate values on the rank 0 node. Then we take the average over them all before scattering them back out to nodes 1,2,3. The following code implements this. 
+```
+if args.local_rank != -1:
+    grads = [p.grad for p in model.parameters()]
+    flat = torch.cat([g.flatten() for g in grads])
+
+    if args.local_rank == 0:
+        gather_list = [torch.zeros_like(flat) for _ in range(args.world_size)]
+    else:
+        gather_list = None
+    torch.distributed.gather(flat, gather_list, dst=0)
+
+    if args.local_rank == 0:
+        avg_flat = torch.stack(gather_list).mean(dim=0)
+        scatter_list = [avg_flat.clone() for _ in range(args.world_size)]
+    else:
+        scatter_list = None
+    torch.distributed.scatter(flat, scatter_list, src=0)
+
+    # Unflatten back into individual gradients
+    offset = 0
+    for p in model.parameters():
+        numel = p.grad.numel()
+        avg_grad = torch.reshape(flat[offset:offset + numel], p.grad.shape)
+        p.grad = avg_grad
+        offset += numel
 ```
 
 Further, we need to use `DistributedSampler` to partition the data into groups of 16. I added a timing loop that measures the iteration time of each except the first minibatch with the following code.
@@ -75,7 +103,7 @@ Further, I collect the loss at each step for each node and plot it on a 2x2 grid
 
 ![task2a2b.png](task2a2b.png)
 
-Notice that since we used the same seed and configuration, the losses are identical between both runs. 
+Notice that since we used the same seed and configuration, the losses are identical between the Part A and Part B runs (both plotted in the figure). 
 
 #### Part B
 
@@ -113,12 +141,62 @@ The loss is shown below with the other tasks
 
 ![./task3.png](./task3.png)
 
-Clearly the loss is taking the same shape, but isn't numerically exactly the same as Task 2A/2B. We will discuss this more in the next section, but I believe this is due to the asynchronous nature of DistributedDataParallel, which may only approximate the gradient sum because it overlaps the communication with the backwards pass. This is described in Section 3.2.3 of https://arxiv.org/pdf/2006.15704, 
-
-> Hence, the reverse order should approximately
-represent the gradient computation order in the backward
-pass
-
-which tells us that the gradient updates are only approximately correct, but numerically very similar to the sequential all_reduce operation. 
+Clearly the loss is taking the same shape, but isn't numerically exactly the same as Task 2A/2B. I believe this is due to the fact that the ordering of the addition operations is reversed and bucketed into separate chunks (because the last weights are shared first) and since floating point operations are not associative, there is a slight numerical mismatch between the forward addition version of GatherScatter/AllReduce and DDP. The communication ordering is described in Section 3.2.3 of https://arxiv.org/pdf/2006.15704.
 
 ### Task 4
+
+The profiles for GatherScatter, AllReduce, and DDP are shown below:
+
+GatherScatter
+![prof-sg.png](prof-sg.png)
+
+The percentage of communication time over the total time for each step is 
+
+```
+1. 22.8s out of 25.3s = 90%
+2. 22.8s out of 25.3s = 90%
+3. 22.8s out of 25.3s = 90%
+```
+It is pretty remarkable how consistent each step is in the profile, down to the tenth of a second. And with 90% of the time spent communicating, we can see that scatter gather is very slow.
+
+
+---
+
+AllReduce
+![prof-ar.png](prof-ar.png)
+
+The percentage of communication time over the total time for each step is 
+
+```
+1. 6.8s out of 9.1s = 75%
+2. 6.6s out of 9.1s = 73%
+3. 6.5s out of 8.7s = 75%
+```
+Now the communication is a much smaller portion of the overall time. Here, the computation still takes about 2.5s of the total time, but the communication is greatly reduced. This reduction comes from the fact that the all reduce parallelizes the communication, versus the sequential version in gather scatter.
+
+---
+
+DDP
+![prof-ddp.png](prof-ddp.png)
+
+The percentage of communication time over the total time for each step is 
+
+```
+1. 5.6s out of 7.2s = 78%
+2. 6.1s out of 7.2s = 85%
+3. 6.0s out of 7.0s = 86%
+```
+
+Here, the communication starts before the backwards pass completes, so some of the communication is parallelized with the computation. This makes the overall iteration time even faster (about 20% faster than AllReduce).
+
+---
+
+#### Discussion
+
+GatherScatter is exceedingly slow for a few reasons. First is the lack of parallelism. It runs the full gather before starting the scatter and does all of the processing on Node 1. The process of averaging among the four nodes per weight is highly parallelizable. Second, the load is fully done on Node 1, so the bottleneck is the network speed getting all the data into and out of that machine. AllReduce and DDP split up the work much more efficiently by both parallelizing the averaging task and by distributing the work over all four nodes which then share among eachother. This utilizes the network resources more evenly which is why AllReduce and DDP are so much faster. 
+
+Regarding DDP and AllReduce: DDP is more efficient than AllReduce. The average AllReduce iteration time is 8.97, while the average DDP iteration time is 7.13, which means DDP is on average
+
+(8.97-7.13)/8.97 = 21% faster.  
+
+This efficiency comes from the fact that the communication overlaps with the computation by starting before the backward pass fully completes. The intuition here is that the weights that have already been updated (farther into the network) can be communicated while the gradients are passed backwards through the network. DDP uses a reverse ordering heuristic, where the farthest back weights in the network are communicated first, which they discuss in Section 3.2.3 of https://arxiv.org/pdf/2006.15704.
